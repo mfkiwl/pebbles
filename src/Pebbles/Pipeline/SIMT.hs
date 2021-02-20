@@ -172,6 +172,7 @@ makeSIMTPipeline c inputs =
     warpId3 :: Reg (Bit t_logWarps) <- makeReg dontCare
     warpId4 :: Reg (Bit t_logWarps) <- makeReg dontCare
     warpId5 :: Reg (Bit t_logWarps) <- makeReg dontCare
+    warpId6 :: Reg (Bit t_logWarps) <- makeReg dontCare
 
     -- Call depth register, for each stage
     state2 :: Reg (SIMTThreadState t_logInstrs t_logMaxCallDepth) <-
@@ -182,19 +183,26 @@ makeSIMTPipeline c inputs =
       makeReg dontCare
     state5 :: Reg (SIMTThreadState t_logInstrs t_logMaxCallDepth) <-
       makeReg dontCare
+    state6 :: Reg (SIMTThreadState t_logInstrs t_logMaxCallDepth) <-
+      makeReg dontCare
 
     -- Active thread mask
     activeMask3 :: Reg (Bit t_warpSize) <- makeReg dontCare
     activeMask4 :: Reg (Bit t_warpSize) <- makeReg dontCare
     activeMask5 :: Reg (Bit t_warpSize) <- makeReg dontCare
+    activeMask6 :: Reg (Bit t_warpSize) <- makeReg dontCare
 
     -- Instruction register for each stage
     instr4 :: Reg (Bit 32) <- makeReg dontCare
     instr5 :: Reg (Bit 32) <- makeReg dontCare
+    instr6 :: Reg (Bit 32) <- makeReg dontCare
 
     -- Is any thread in the current warp suspended?
     isSusp4 :: Reg (Bit 1) <- makeReg dontCare
     isSusp5 :: Reg (Bit 1) <- makeReg dontCare
+
+    -- Was the execute stage triggered?
+    didExec :: Reg (Bit 1) <- makeDReg false
 
     -- Kernel response queue (indicates to CPU when kernel has finished)
     kernelRespQueue :: Queue SIMTResp <- makeShiftQueue 1
@@ -350,32 +358,6 @@ makeSIMTPipeline c inputs =
     -- Buffer the decode tables
     let tagMap5 = Map.map buffer tagMap4
 
-    -- Insert warp id back into warp queue, except on warp termination
-    always do
-      when (go5.val) do
-        if inputs.simtWarpTerminatedWire.active
-          then do
-            -- We assume that a warp only terminates when it has converged
-            dynamicAssert (activeMask5.val .==. ones)
-              "SIMT pipeline: terminating warp that hasn't converged"
-            completedWarps <== completedWarps.val + 1
-            -- Have all warps have terminated?
-            if completedWarps.val .==. ones
-              then do
-                -- Issue kernel response to CPU
-                dynamicAssert (kernelRespQueue.notFull)
-                  "SIMT pipeline: can't issue kernel response"
-                enq kernelRespQueue (kernelSuccess.val)
-                -- Re-enter initial state
-                pipelineActive <== false
-                kernelSuccess <== true
-              else do
-                kernelSuccess <== kernelSuccess.val .&.
-                  inputs.simtWarpTerminatedWire.val
-          else do
-            dynamicAssert (warpQueue.notFull) "SIMT warp queue overflow"
-            enq warpQueue (warpId5.val)
-
     -- Vector lane definition
     let makeLane makeExecStage threadActive suspMask regFileA
                  regFileB stateMem incCallDepth decCallDepth = do
@@ -411,34 +393,73 @@ makeSIMTPipeline c inputs =
             }
 
           always do
+
             -- Execute stage
+            -- =============
+
             when (go5.val .&. threadActive .&. isSusp5.val.inv) do
-              -- Trigger execute stage
+              -- Execute stage
               execStage.execute
+              didExec <== true
 
-              -- Only update PC if not retrying
-              when (retryWire.val.inv) do
-                -- Compute new call depth increment
-                let inc = incCallDepth.zeroExtendCast
-                let dec = decCallDepth.zeroExtendCast
-                dynamicAssert (state5.val.simtCallDepth .!=. 0)
-                  "SIMT pipeliene: call depth overflow"
-                -- Update thread state
-                store stateMem (warpId5.val)
-                  SIMTThreadState {
-                      simtPC = pcNextWire.val
-                      -- Remember, lower is deeper
-                    , simtCallDepth = (state5.val.simtCallDepth - inc) + dec
-                    }
-
-              -- Update suspension bits
-              when (suspWire.val) do
-                suspMask!(warpId5.val) <== true
+            -- Prepare writeback stage
+            instr6 <== instr5.val
+            state6 <== state5.val
+            warpId6 <== warpId5.val
+            activeMask6 <== activeMask5.val
 
             -- Writeback stage
+            -- ===============
+
+            -- Insert warp id back into warp queue, except on warp termination
+            when (go5.val.old) do
+              if inputs.simtWarpTerminatedWire.active.old
+                then do
+                  -- A warp should only terminate when it has converged
+                  dynamicAssert (activeMask6.val .==. ones)
+                    "SIMT pipeline: terminating warp that hasn't converged"
+                  completedWarps <== completedWarps.val + 1
+                  -- Have all warps have terminated?
+                  if completedWarps.val .==. ones
+                    then do
+                      -- Issue kernel response to CPU
+                      dynamicAssert (kernelRespQueue.notFull)
+                        "SIMT pipeline: can't issue kernel response"
+                      enq kernelRespQueue (kernelSuccess.val)
+                      -- Re-enter initial state
+                      pipelineActive <== false
+                      kernelSuccess <== true
+                    else do
+                      kernelSuccess <== kernelSuccess.val .&.
+                        inputs.simtWarpTerminatedWire.val.old
+                else do
+                  dynamicAssert (warpQueue.notFull) "SIMT warp queue overflow"
+                  enq warpQueue (warpId6.val)
+
+            -- Only update PC if not retrying
+            when (didExec.val) do
+              when (retryWire.val.old.inv) do
+                -- Compute new call depth increment
+                let inc = incCallDepth.zeroExtendCast.old
+                let dec = decCallDepth.zeroExtendCast.old
+                dynamicAssert (state6.val.simtCallDepth .!=. 0)
+                  "SIMT pipeline: call depth overflow"
+                -- Update thread state
+                store stateMem (warpId6.val)
+                  SIMTThreadState {
+                      simtPC = pcNextWire.val.old
+                      -- Remember, lower is deeper
+                    , simtCallDepth = (state6.val.simtCallDepth - inc) + dec
+                    }
+
+            -- Update suspension bits
+            when (suspWire.val.old) do
+              suspMask!(warpId6.val) <== true
+
+            -- Register file write
             if resultWire.active.old
               then do
-                let idx = (warpId5.val.old, instr5.val.dst.old)
+                let idx = (warpId6.val, instr6.val.dst)
                 let value = resultWire.val.old
                 store regFileA idx value
                 store regFileB idx value
